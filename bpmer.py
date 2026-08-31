@@ -7,6 +7,7 @@ import json
 import plistlib
 import re
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -188,6 +189,7 @@ def set_bpm_via_applescript(persistent_id: str, bpm: int) -> None:
     result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
     if result.returncode == 0:
         return
+    time.sleep(0.75)
 
     message = result.stderr.strip() or f"osascript exited with status {result.returncode}"
     if "-1743" in message or "not authorized" in message.lower():
