@@ -1,0 +1,6 @@
+{
+  "library_xml": "Library.xml",
+  "completed_log": "completed.jsonl",
+  "lookup_cache": "lookup_cache.jsonl",
+  "getsongbpm_api_key": "API_KEY"
+}

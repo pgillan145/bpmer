@@ -1,4 +1,6 @@
+.DS_Store
 .venv
 Library.xml
-getsongbpm.json
+config.json
 completed.jsonl
+lookup_cache.jsonl
