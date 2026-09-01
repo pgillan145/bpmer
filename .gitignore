@@ -4,3 +4,4 @@ Library.xml
 config.json
 completed.jsonl
 lookup_cache.jsonl
+*.swp
