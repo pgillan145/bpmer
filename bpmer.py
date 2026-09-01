@@ -162,7 +162,20 @@ def lookup_track_info(track: Track, lookup_cache: dict, api_key: str) -> dict | 
     from "we don't actually know, try again".
     """
 
-
+    # TODO: add a loop somewhere to fudge the artist and track names to see if maybe
+    #       something else matches better. For example:
+    #           s/ \& / and /;
+    #           s/ \(\d\d\d\d Remaster\)$//;
+    #           s/ Featuring .*$//;
+    #       I'm imagining refactoring the search functionationality of these function into a
+    #       separate function that can be called multiple times as we look through a while tweak(arist/song)
+    #       loop until we either find something or we run out of ways to tweak the artist/song.
+    #       while (lookup):
+    #         match = _lookup_track_info(lookup)
+    #         if (match):
+    #            break
+    #         lookup = massage_lookup(lookup)
+    #
     lookup = f"song:{track['name']} artist:{track['artist']}"
     if lookup in lookup_cache:
         return lookup_cache[lookup]
@@ -224,8 +237,21 @@ def set_bpm_via_applescript(persistent_id: str, bpm: int) -> None:
         f'    set bpm of (first track whose persistent ID is "{persistent_id}") to {bpm}\n'
         "end tell\n"
     )
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    time.sleep(0.75)
+    interrupted = False
+    done = False
+    while done is False:
+        try:
+            result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+            done = True
+        except KeyboardInterrupt:
+            print("osascript interrupted - retrying")
+            interrupted = True
+            continue
+        time.sleep(0.75)
+
+    if (interrupted is True):
+        sys.exit()
+
     if result.returncode == 0:
         return
 
@@ -250,7 +276,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def confirm_process(track: Track, bpm: int) -> bool:
-    prompt = f"set {track['artist']} - {track['name']} to {bpm} BPM? [Y/n/q] "
+    prompt = f" set {track['artist']} - {track['name']} to {bpm} BPM? [Y/n/q] "
     while True:
         response = input(prompt).strip().lower()
         if response in ("", "y"):
