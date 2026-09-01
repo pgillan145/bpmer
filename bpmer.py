@@ -112,7 +112,7 @@ def iter_pending_tracks(
 
 
 def load_lookup_cache(cache_path: Path) -> dict[str, dict | None]:
-    """Map persistent_id -> the GetSongBPM match previously found for it (or None for no match).
+    """Map lookup -> the GetSongBPM match previously found for it (or None for no match).
 
     This only ever holds real answers from GetSongBPM, never failed lookups —
     a network/API error should still be retried on the next run.
@@ -125,18 +125,19 @@ def load_lookup_cache(cache_path: Path) -> dict[str, dict | None]:
             line = line.strip()
             if line:
                 entry = json.loads(line)
-                cache[entry["persistent_id"]] = entry["match"]
+                cache[entry["lookup"]] = entry["match"]
     return cache
 
 
-def cache_lookup(persistent_id: str, lookup_cache: dict, match: dict | None, cache_path: Path = None) -> None:
+def cache_lookup(lookup: str, lookup_cache: dict, match: dict | None, cache_path: Path = None) -> None:
     if (cache_path is None):
         cache_path = config['lookup_cache']
-    entry = {"persistent_id": persistent_id, "match": match}
+
+    entry = {"lookup": lookup, "match": match}
     with cache_path.open("a") as f:
         f.write(json.dumps(entry) + "\n")
 
-    lookup_cache[persistent_id] = match
+    lookup_cache[lookup] = match
 
 
 class GetSongBPMError(Exception):
@@ -160,12 +161,12 @@ def lookup_track_info(track: Track, lookup_cache: dict, api_key: str) -> dict | 
     lookup itself failed, so callers can tell "no data for this song" apart
     from "we don't actually know, try again".
     """
-    persistent_id = track['persistent_id']
-    if persistent_id in lookup_cache:
-        return lookup_cache[persistent_id]
 
 
     lookup = f"song:{track['name']} artist:{track['artist']}"
+    if lookup in lookup_cache:
+        return lookup_cache[lookup]
+
     query = urllib.parse.urlencode({"api_key": api_key, "type": "both", "lookup": lookup})
     url = f"{GETSONGBPM_SEARCH_URL}?{query}"
 
@@ -189,16 +190,18 @@ def lookup_track_info(track: Track, lookup_cache: dict, api_key: str) -> dict | 
         raise GetSongBPMError(f"GetSongBPM returned a response that wasn't JSON: {e}") from e
 
     results = data.get("search")
-    if isinstance(results, dict):
-        # documented "no match" shape: {"search": {"error": "no result"}}
-        return None
-    if not isinstance(results, list):
-        raise GetSongBPMError(f"unexpected GetSongBPM response shape: {data!r}")
-    if not results:
-        return None
+    ret = None
 
-    cache_lookup(persistent_id, lookup_cache, results[0])
-    return results[0]
+    if not results or isinstance(results, dict):
+        # documented "no match" shape: {"search": {"error": "no result"}}
+        pass
+    elif not isinstance(results, list):
+        raise GetSongBPMError(f"unexpected GetSongBPM response shape: {data!r}")
+    else:
+        ret = results[0]
+
+    cache_lookup(lookup, lookup_cache, ret)
+    return ret
 
 
 PERSISTENT_ID_RE = re.compile(r"[0-9A-Fa-f]+")
@@ -266,9 +269,11 @@ def main() -> None:
     args = parse_args()
     config = load_config()
     api_key = config["getsongbpm_api_key"]
+
     lookup_cache = load_lookup_cache(config["lookup_cache"])
     completed_ids = load_completed_ids(config["completed_log"])
     pending = list(iter_pending_tracks(config["library_xml"], completed_ids))
+
     print(f"{len(completed_ids)} already completed, {len(pending)} pending")
 
     for track in pending:
