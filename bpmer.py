@@ -17,6 +17,7 @@ from typing import Iterator, TypedDict
 CONFIG_FILE = Path("config.json")
 GETSONGBPM_SEARCH_URL = "https://api.getsong.co/search/"
 
+config = None
 
 class Track(TypedDict):
     persistent_id: str
@@ -67,6 +68,19 @@ def mark_completed(track: Track, bpm: int, log_path: Path) -> None:
         f.write(json.dumps(entry) + "\n")
 
 
+def _library_track_ids(library: dict) -> set[int] | None:
+    """Track IDs actually in the library, or None if the master playlist wasn't found.
+
+    A track can appear in Tracks but not in the master "Library" playlist when
+    it was added to some other playlist without being added to the library
+    itself — Music.app shows these as "Playlist Only".
+    """
+    master = next((p for p in library.get("Playlists", []) if p.get("Master")), None)
+    if master is None:
+        return None
+    return {item["Track ID"] for item in master.get("Playlist Items", [])}
+
+
 def iter_pending_tracks(
     library_xml_path: Path,
     completed_ids: set[str],
@@ -74,15 +88,26 @@ def iter_pending_tracks(
     with library_xml_path.open("rb") as f:
         library = plistlib.load(f)
 
+    library_track_ids = _library_track_ids(library)
+
     for track in library["Tracks"].values():
         persistent_id = track.get("Persistent ID")
         if not persistent_id or persistent_id in completed_ids:
             continue
+        if library_track_ids is not None and track.get("Track ID") not in library_track_ids:
+            continue  # Playlist Only — not actually in the library
         name = track.get("Name")
         artist = track.get("Artist")
         bpm = track.get("BPM")
-        if not name or not artist or bpm:
+
+        # disregard any tracks with no name or artist
+        if not name or not artist:
             continue
+
+        # disregard any tracks where bpm is already set to somethine (even 0)
+        if bpm != None and int(bpm) >= 0:
+            continue
+
         yield Track(persistent_id=persistent_id, name=name, artist=artist, bpm=bpm)
 
 
@@ -104,10 +129,14 @@ def load_lookup_cache(cache_path: Path) -> dict[str, dict | None]:
     return cache
 
 
-def cache_lookup(persistent_id: str, match: dict | None, cache_path: Path) -> None:
+def cache_lookup(persistent_id: str, lookup_cache: dict, match: dict | None, cache_path: Path = None) -> None:
+    if (cache_path is None):
+        cache_path = config['lookup_cache']
     entry = {"persistent_id": persistent_id, "match": match}
     with cache_path.open("a") as f:
         f.write(json.dumps(entry) + "\n")
+
+    lookup_cache[persistent_id] = match
 
 
 class GetSongBPMError(Exception):
@@ -118,7 +147,7 @@ class GetSongBPMAuthError(GetSongBPMError):
     """GetSongBPM rejected the request in a way that will affect every other lookup too."""
 
 
-def lookup_track_info(track: Track, api_key: str) -> dict | None:
+def lookup_track_info(track: Track, lookup_cache: dict, api_key: str) -> dict | None:
     """Return GetSongBPM's full best-match record, or None if it has no match.
 
     The record includes tempo, time_sig, key_of, open_key, danceability,
@@ -131,6 +160,11 @@ def lookup_track_info(track: Track, api_key: str) -> dict | None:
     lookup itself failed, so callers can tell "no data for this song" apart
     from "we don't actually know, try again".
     """
+    persistent_id = track['persistent_id']
+    if persistent_id in lookup_cache:
+        return lookup_cache[persistent_id]
+
+
     lookup = f"song:{track['name']} artist:{track['artist']}"
     query = urllib.parse.urlencode({"api_key": api_key, "type": "both", "lookup": lookup})
     url = f"{GETSONGBPM_SEARCH_URL}?{query}"
@@ -163,6 +197,7 @@ def lookup_track_info(track: Track, api_key: str) -> dict | None:
     if not results:
         return None
 
+    cache_lookup(persistent_id, lookup_cache, results[0])
     return results[0]
 
 
@@ -187,9 +222,9 @@ def set_bpm_via_applescript(persistent_id: str, bpm: int) -> None:
         "end tell\n"
     )
     result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    time.sleep(0.75)
     if result.returncode == 0:
         return
-    time.sleep(0.75)
 
     message = result.stderr.strip() or f"osascript exited with status {result.returncode}"
     if "-1743" in message or "not authorized" in message.lower():
@@ -212,66 +247,72 @@ def parse_args() -> argparse.Namespace:
 
 
 def confirm_process(track: Track, bpm: int) -> bool:
-    prompt = f"Set {track['artist']} - {track['name']} to {bpm} BPM? [Y/q] "
+    prompt = f"set {track['artist']} - {track['name']} to {bpm} BPM? [Y/n/q] "
     while True:
         response = input(prompt).strip().lower()
         if response in ("", "y"):
-            return True
+            return 1
+        if response == "n":
+            return 0
         if response == "q":
-            return False
-        print("Enter to process, or q to quit.")
+            return -1
+
+        print("Enter or Y to continue, n to skip, or q to quit.")
 
 
 def main() -> None:
+    global config
+
     args = parse_args()
     config = load_config()
     api_key = config["getsongbpm_api_key"]
-    completed_ids = load_completed_ids(config["completed_log"])
     lookup_cache = load_lookup_cache(config["lookup_cache"])
+    completed_ids = load_completed_ids(config["completed_log"])
     pending = list(iter_pending_tracks(config["library_xml"], completed_ids))
     print(f"{len(completed_ids)} already completed, {len(pending)} pending")
 
     for track in pending:
-        persistent_id = track["persistent_id"]
-        if persistent_id in lookup_cache:
-            match = lookup_cache[persistent_id]
-        else:
-            print(f"Looking up data for {track['artist']} - {track['name']}")
-            try:
-                match = lookup_track_info(track, api_key)
-            except GetSongBPMAuthError as e:
-                print(f"FATAL: {e}")
-                break
-            except GetSongBPMError as e:
-                print(f"  SKIPPED (lookup failed): {track['artist']} - {track['name']}: {e}")
-                continue
-            cache_lookup(persistent_id, match, config["lookup_cache"])
-            lookup_cache[persistent_id] = match
+        print(f"\nProcessing {track['artist']} - {track['name']}")
+        try:
+            print(f"  Searching... ", end="")
+            match = lookup_track_info(track, lookup_cache, api_key)
+        except GetSongBPMAuthError as e:
+            print(f" FATAL: {e}")
+            break
+        except GetSongBPMError as e:
+            print(f" FAILED {track['artist']} - {track['name']}: {e}")
+            continue
 
         tempo = match.get("tempo") if match else None
         if tempo is None:
-            print(f"  SKIPPED (no BPM found): {track['artist']} - {track['name']}")
+            print(f" SKIPPED: No BPM found")
             continue
         try:
             bpm = round(float(tempo))
         except (TypeError, ValueError):
-            print(f"  SKIPPED (unexpected tempo value {tempo!r}): {track['artist']} - {track['name']}")
+            print(f" SKIPPED: unexpected tempo value {tempo!r}")
             continue
 
-        if not args.yes and not confirm_process(track, bpm):
-            print("Quitting.")
-            break
+        if not args.yes:
+            confirm = confirm_process(track, bpm)
+            if (confirm < 0):
+                break
+            elif (config == 0):
+                print("Quitting.")
+                break
+
         try:
+            print("  updating Apple Music... ", end = "")
             set_bpm_via_applescript(track["persistent_id"], bpm)
         except AppleScriptFatalError as e:
-            print(f"FATAL: {e}")
+            print(f" FATAL {e}")
             break
         except AppleScriptError as e:
-            print(f"  SKIPPED (AppleScript failed): {track['artist']} - {track['name']}: {e}")
+            print(f" FAILED: {e}")
             continue
 
         mark_completed(track, bpm, config["completed_log"])
-        print(f"  done: {track['artist']} - {track['name']}  ({track['persistent_id']})  bpm={bpm}")
+        print(f" bpm set to {bpm} bpm")
 
 
 if __name__ == "__main__":
