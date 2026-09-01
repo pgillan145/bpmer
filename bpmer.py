@@ -296,10 +296,10 @@ def main() -> None:
         if not args.yes:
             confirm = confirm_process(track, bpm)
             if (confirm < 0):
-                break
-            elif (config == 0):
                 print("Quitting.")
                 break
+            elif (confirm == 0):
+                continue
 
         try:
             print("  updating Apple Music... ", end = "")
