@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+from itertools import combinations
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -101,6 +102,9 @@ def iter_pending_tracks(
         name = track.get("Name")
         artist = track.get("Artist")
         bpm = track.get("BPM")
+
+        name = re.sub(r'&#38;', '&', name)
+        artist = re.sub(r'&#38;', '&', artist)
 
         # disregard any tracks with no name or artist
         if not name or not artist:
@@ -209,78 +213,58 @@ def lookup_track_info_getSongBPM(artist: str, name: str, lookup_cache: dict) -> 
 def lookup_track_info(track: Track, lookup_cache: dict) -> dict | None:
     """Check available sources for a BPM record, or None if it has no match.
 
+    Tries every combination of artist/name variant (original names first)
+    until one of them gets a match.
     """
-
-    artist = track['artist']
-    name = track['name']
-    info = None
-    first = True
-
-    new_artist = artist
-    while (new_artist is not None):
-        new_name = name
-        first = True
-        while new_name is not None:
-            #print("NEW", new_artist, new_name)
-            info  = lookup_track_info_getSongBPM(new_artist, new_name, lookup_cache)
-            if (info is not None):
+    for artist_variant in _artist_variants(track['artist']):
+        for name_variant in _name_variants(track['name']):
+            info = lookup_track_info_getSongBPM(artist_variant, name_variant, lookup_cache)
+            if info is not None:
                 return info
-            new_name = massage_name(new_name, first = first)
-            first = False
-
-        new_artist = massage_artist(new_artist)
-
-    return info
-
-def massage_name(name: str, first: bool = False) -> str | None:
-    #print("MASSAGING", name)
-    m = re.search(' \&#38; ', name)
-    if (m):
-        new_name = re.sub(' \&#38; ', ' & ', name)
-        #print("RETRY", new_name)
-        return new_name
-
-    if (first is True):
-        m = re.search(' and ', name)
-        if (m):
-            new_name = re.sub(' and ', ' & ', name)
-            #print("RETRY", new_name)
-            return new_name
-    else:
-        m = re.search(' \& ', name)
-        if (m):
-            new_name = re.sub(' \& ', ' and ', name)
-            #print("RETRY", new_name)
-            return new_name
-
-    m = re.search(r' \(\d\d\d\d Remaster\)$', name)
-    if (m):
-        new_name = re.sub(r' \(\d\d\d\d Remaster\)$', '', name)
-        #print("RETRY", new_name)
-        return new_name
-
-    m = re.search(r' \(Remastered \d\d\d\d\)$', name)
-    if (m):
-        new_name = re.sub(' \(Remastered \d\d\d\d\)$', '', name)
-        #print("RETRY", new_name)
-        return new_name
-
     return None
 
-def massage_artist(artist: str) -> str | None:
-    m = re.search(' \&#38; ', artist)
-    if (m):
-        new_artist = re.sub(r' \&#38; ', ' & ', artist)
-        #print("RETRY", new_artist)
-        return new_artist
 
-    m = re.search(' \& ', artist)
-    if (m):
-        new_artist = re.sub(' \& ', ' and ', artist)
-        #print("RETRY", new_artist)
-        return new_artist
+def _dedup_list(items: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
 
-    return None
+
+NAME_ALTERATIONS = [
+    (r' & ', ' and '),
+    (r' and ', ' & '),
+    (r' \(\d{4} Remaster\)$', ''),
+    (r' \(Remastered \d{4}\)$', ''),
+]
+
+ARTIST_ALTERATIONS = [
+    (r' & ', ' and '),
+    (r' and ', ' & '),
+]
+
+
+def _all_variants(text: str, alterations: list[tuple[str, str]]) -> list[str]:
+    """Every variant of text from applying every combination of alterations."""
+    variants = [text]
+    for r in range(1, len(alterations) + 1):
+        for combo in combinations(alterations, r):
+            variant = text
+            for pattern, repl in combo:
+                variant = re.sub(pattern, repl, variant)
+            variants.append(variant)
+    return _dedup_list(variants)
+
+
+def _name_variants(name: str) -> list[str]:
+    return _all_variants(name, NAME_ALTERATIONS)
+
+
+def _artist_variants(artist: str) -> list[str]:
+    return _all_variants(artist, ARTIST_ALTERATIONS)
 
 class AppleScriptError(Exception):
     """Writing bpm for this track failed (as opposed to a systemic automation problem)."""
