@@ -7,6 +7,7 @@ import json
 import plistlib
 import re
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -16,6 +17,7 @@ from typing import Iterator, TypedDict
 
 CONFIG_FILE = Path("config.json")
 GETSONGBPM_SEARCH_URL = "https://api.getsong.co/search/"
+PERSISTENT_ID_RE = re.compile(r"[0-9A-Fa-f]+")
 
 config = None
 
@@ -140,15 +142,15 @@ def cache_lookup(lookup: str, lookup_cache: dict, match: dict | None, cache_path
     lookup_cache[lookup] = match
 
 
-class GetSongBPMError(Exception):
-    """A GetSongBPM lookup failed outright (as opposed to finding no match)."""
+class APIError(Exception):
+    """An API  lookup failed outright (as opposed to finding no match)."""
 
 
-class GetSongBPMAuthError(GetSongBPMError):
-    """GetSongBPM rejected the request in a way that will affect every other lookup too."""
+class APIAuthError(APIError):
+    """API rejected the request in a way that will affect every other lookup too."""
 
 
-def lookup_track_info(track: Track, lookup_cache: dict, api_key: str) -> dict | None:
+def lookup_track_info_getSongBPM(artist: str, name: str, lookup_cache: dict) -> dict | None:
     """Return GetSongBPM's full best-match record, or None if it has no match.
 
     The record includes tempo, time_sig, key_of, open_key, danceability,
@@ -157,26 +159,14 @@ def lookup_track_info(track: Track, lookup_cache: dict, api_key: str) -> dict | 
     home in Music.app (bpm); the full record is cached in lookup_cache.jsonl
     in case a use for the rest of it turns up later.
 
-    Raises GetSongBPMError (or the more specific GetSongBPMAuthError) if the
+    Raises APIError (or the more specific APIAuthError) if the
     lookup itself failed, so callers can tell "no data for this song" apart
     from "we don't actually know, try again".
     """
 
-    # TODO: add a loop somewhere to fudge the artist and track names to see if maybe
-    #       something else matches better. For example:
-    #           s/ \& / and /;
-    #           s/ \(\d\d\d\d Remaster\)$//;
-    #           s/ Featuring .*$//;
-    #       I'm imagining refactoring the search functionationality of these function into a
-    #       separate function that can be called multiple times as we look through a while tweak(arist/song)
-    #       loop until we either find something or we run out of ways to tweak the artist/song.
-    #       while (lookup):
-    #         match = _lookup_track_info(lookup)
-    #         if (match):
-    #            break
-    #         lookup = massage_lookup(lookup)
-    #
-    lookup = f"song:{track['name']} artist:{track['artist']}"
+    api_key = config["getsongbpm_api_key"]
+    lookup = f"song:{name} artist:{artist}"
+    #print("GETSONGBPM", lookup)
     if lookup in lookup_cache:
         return lookup_cache[lookup]
 
@@ -188,19 +178,19 @@ def lookup_track_info(track: Track, lookup_cache: dict, api_key: str) -> dict | 
             body = resp.read()
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
-            raise GetSongBPMAuthError(
-                f"GetSongBPM request rejected (HTTP {e.code}) — likely a bad API key or a "
+            raise APIAuthError(
+                f"GetSongBPM API request rejected (HTTP {e.code}) — likely a bad API key or a "
                 "block on this endpoint; every other lookup would fail the same way"
             ) from e
-        raise GetSongBPMError(f"GetSongBPM returned HTTP {e.code}") from e
+        raise APIError(f"GetSongBPM returned HTTP {e.code}") from e
     except OSError as e:
         # covers URLError, timeouts, DNS failures, connection resets, etc.
-        raise GetSongBPMError(f"network error contacting GetSongBPM: {e}") from e
+        raise APIError(f"network error contacting GetSongBPM: {e}") from e
 
     try:
         data = json.loads(body)
     except json.JSONDecodeError as e:
-        raise GetSongBPMError(f"GetSongBPM returned a response that wasn't JSON: {e}") from e
+        raise APIError(f"GetSongBPM returned a response that wasn't JSON: {e}") from e
 
     results = data.get("search")
     ret = None
@@ -209,16 +199,88 @@ def lookup_track_info(track: Track, lookup_cache: dict, api_key: str) -> dict | 
         # documented "no match" shape: {"search": {"error": "no result"}}
         pass
     elif not isinstance(results, list):
-        raise GetSongBPMError(f"unexpected GetSongBPM response shape: {data!r}")
+        raise APIError(f"unexpected GetSongBPM response shape: {data!r}")
     else:
         ret = results[0]
 
     cache_lookup(lookup, lookup_cache, ret)
     return ret
 
+def lookup_track_info(track: Track, lookup_cache: dict) -> dict | None:
+    """Check available sources for a BPM record, or None if it has no match.
 
-PERSISTENT_ID_RE = re.compile(r"[0-9A-Fa-f]+")
+    """
 
+    artist = track['artist']
+    name = track['name']
+    info = None
+    first = True
+
+    new_artist = artist
+    while (new_artist is not None):
+        new_name = name
+        first = True
+        while new_name is not None:
+            #print("NEW", new_artist, new_name)
+            info  = lookup_track_info_getSongBPM(new_artist, new_name, lookup_cache)
+            if (info is not None):
+                return info
+            new_name = massage_name(new_name, first = first)
+            first = False
+
+        new_artist = massage_artist(new_artist)
+
+    return info
+
+def massage_name(name: str, first: bool = False) -> str | None:
+    #print("MASSAGING", name)
+    m = re.search(' \&#38; ', name)
+    if (m):
+        new_name = re.sub(' \&#38; ', ' & ', name)
+        #print("RETRY", new_name)
+        return new_name
+
+    if (first is True):
+        m = re.search(' and ', name)
+        if (m):
+            new_name = re.sub(' and ', ' & ', name)
+            #print("RETRY", new_name)
+            return new_name
+    else:
+        m = re.search(' \& ', name)
+        if (m):
+            new_name = re.sub(' \& ', ' and ', name)
+            #print("RETRY", new_name)
+            return new_name
+
+    m = re.search(r' \(\d\d\d\d Remaster\)$', name)
+    if (m):
+        new_name = re.sub(r' \(\d\d\d\d Remaster\)$', '', name)
+        #print("RETRY", new_name)
+        return new_name
+
+    m = re.search(r' \(Remastered \d\d\d\d\)$', name)
+    if (m):
+        new_name = re.sub(' \(Remastered \d\d\d\d\)$', '', name)
+        #print("RETRY", new_name)
+        return new_name
+
+    return None
+
+def massage_artist(artist: str) -> str | None:
+    m = re.search(' \&#38; ', artist)
+    if (m):
+        new_artist = re.sub(r' \&#38; ', ' & ', artist)
+        #print("RETRY", new_artist)
+        return new_artist
+
+    m = re.search(' \& ', artist)
+    if (m):
+        new_artist = re.sub(' \& ', ' and ', artist)
+        #print("RETRY", new_artist)
+        return new_artist
+
+    return None
 
 class AppleScriptError(Exception):
     """Writing bpm for this track failed (as opposed to a systemic automation problem)."""
@@ -294,7 +356,6 @@ def main() -> None:
 
     args = parse_args()
     config = load_config()
-    api_key = config["getsongbpm_api_key"]
 
     lookup_cache = load_lookup_cache(config["lookup_cache"])
     completed_ids = load_completed_ids(config["completed_log"])
@@ -304,24 +365,31 @@ def main() -> None:
 
     for track in pending:
         print(f"\nProcessing {track['artist']} - {track['name']}")
+
         try:
             print(f"  Searching... ", end="")
-            match = lookup_track_info(track, lookup_cache, api_key)
-        except GetSongBPMAuthError as e:
+            match = lookup_track_info(track, lookup_cache)
+        except APIAuthError as e:
             print(f" FATAL: {e}")
             break
-        except GetSongBPMError as e:
+        except APIError as e:
             print(f" FAILED {track['artist']} - {track['name']}: {e}")
             continue
+
 
         tempo = match.get("tempo") if match else None
         if tempo is None:
             print(f" SKIPPED: No BPM found")
             continue
+
         try:
             bpm = round(float(tempo))
         except (TypeError, ValueError):
             print(f" SKIPPED: unexpected tempo value {tempo!r}")
+            continue
+
+        if (bpm > 240):
+            print(f" SKIPPED: tempo way too high {tempo!r}")
             continue
 
         if not args.yes:
@@ -341,6 +409,7 @@ def main() -> None:
         except AppleScriptError as e:
             print(f" FAILED: {e}")
             continue
+
 
         mark_completed(track, bpm, config["completed_log"])
         print(f" bpm set to {bpm} bpm")
